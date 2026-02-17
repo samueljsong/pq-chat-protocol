@@ -12,7 +12,7 @@ public class TcpChatServer
     // userId -> connection
     private readonly ConcurrentDictionary<string, ClientConn> _users = new();
 
-    // conversationId -> set of userIds (or connections)
+    // conversationId -> set of userIds
     private readonly ConcurrentDictionary<string, ConcurrentDictionary<string, byte>> _rooms = new();
 
     public TcpChatServer(int port)
@@ -20,173 +20,181 @@ public class TcpChatServer
         _port = port;
     }
 
-    public async Task RunAsync(CancellationToken ct)
+    public async Task RunAsync(CancellationToken cancellationToken)
     {
         var listener = new TcpListener(IPAddress.Any, _port);
         listener.Start();
         Console.WriteLine($"TCP Chat Server listening on port {_port}");
 
-        while (!ct.IsCancellationRequested)
+        while (!cancellationToken.IsCancellationRequested)
         {
-            var tcp = await listener.AcceptTcpClientAsync(ct);
-            _ = HandleClientAsync(tcp, ct); // fire & forget per client
+            var tcp = await listener.AcceptTcpClientAsync(cancellationToken);
+            _ = HandleClientAsync(tcp, cancellationToken); // fire & forget per client
         }
     }
 
-    private async Task HandleClientAsync(TcpClient tcp, CancellationToken ct)
+    private async Task HandleClientAsync(TcpClient tcp, CancellationToken cancellationToken)
     {
-        var conn = new ClientConn(tcp);
+        var connection = new ClientConn(tcp);
         try
         {
-            while (!ct.IsCancellationRequested)
+            while (!cancellationToken.IsCancellationRequested)
             {
-                var payload = await ReadFrame(conn.Stream, ct);
+                var payload = await ReadFrame(connection.Stream, cancellationToken);
                 if (payload is null) break;
 
                 var json = Encoding.UTF8.GetString(payload);
-                var msg = JsonSerializer.Deserialize<ClientMsg>(json);
+                var msg  = JsonSerializer.Deserialize<ClientMsg>(json);
                 if (msg is null) continue;
 
                 switch (msg.Type)
                 {
                     case "AUTH":
-                        // TODO: validate JWT token properly and extract userId.
-                        // For prototype: treat token field as userId (DON'T ship this).
+                    {
                         var userId = ValidateTokenAndGetUserId(msg.Token);
-                        conn.UserId = userId;
+                        connection.UserId = userId;
 
-                        _users[userId] = conn;
+                        _users[userId] = connection;
 
-                        await SendAsync(conn, new ServerMsg
+                        await SendAsync(connection, new ServerMsg
                         {
                             Type = "AUTH_OK",
                             UserId = userId
-                        }, ct);
+                        }, cancellationToken);
+
                         break;
+                    }
 
                     case "JOIN_CONVERSATION":
-                        EnsureAuthed(conn);
+                    {
+                        EnsureAuthed(connection);
 
-                        // TODO: verify membership in DB:
-                        // SELECT 1 FROM conversation_members WHERE conversation_id=@cid AND user_id=@uid AND left_at IS NULL;
-                        var cid = msg.ConversationId ?? throw new Exception("Missing conversationId");
+                        var conversationId = msg.ConversationId ?? throw new Exception("Missing conversationId");
 
-                        var set = _rooms.GetOrAdd(cid, _ => new ConcurrentDictionary<string, byte>());
-                        set[conn.UserId!] = 0;
+                        var set = _rooms.GetOrAdd(conversationId, _ => new ConcurrentDictionary<string, byte>());
+                        set[connection.UserId!] = 0;
 
-                        await SendAsync(conn, new ServerMsg
+                        await SendAsync(connection, new ServerMsg
                         {
-                            Type = "JOIN_OK",
-                            ConversationId = cid
-                        }, ct);
+                            Type           = "JOIN_OK",
+                            UserId         = connection.UserId,
+                            ConversationId = conversationId
+                        }, cancellationToken);
+
                         break;
+                    }
 
                     case "SEND_MESSAGE":
-                        EnsureAuthed(conn);
+                    {
+                        EnsureAuthed(connection);
 
-                        var convId = msg.ConversationId ?? throw new Exception("Missing conversationId");
-                        var ciphertext = msg.Ciphertext ?? "";
+                        var conversationId = msg.ConversationId ?? throw new Exception("Missing conversationId");
+                        var ciphertext     = msg.Ciphertext ?? "";
 
                         // Verify sender joined / is member
-                        if (!_rooms.TryGetValue(convId, out var members) || !members.ContainsKey(conn.UserId!))
+                        if (!_rooms.TryGetValue(conversationId, out var members) || !members.ContainsKey(connection.UserId!))
                             throw new Exception("Not joined to conversation");
 
-                        // Forward to all other online members
+                        // Forward MESSAGE to all other online members
                         foreach (var memberUserId in members.Keys)
                         {
-                            if (memberUserId == conn.UserId) continue;
+                            if (memberUserId == connection.UserId) continue;
 
                             if (_users.TryGetValue(memberUserId, out var target) && target.IsOpen)
                             {
                                 await SendAsync(target, new ServerMsg
                                 {
-                                    Type = "MESSAGE",
-                                    ConversationId = convId,
-                                    FromUserId = conn.UserId,
-                                    Ciphertext = ciphertext
-                                }, ct);
+                                    Type           = "MESSAGE",
+                                    ConversationId = conversationId,
+                                    FromUserId     = connection.UserId,
+                                    Ciphertext     = ciphertext
+                                }, cancellationToken);
                             }
                         }
 
-                        // Optional: ack sender
-                        await SendAsync(conn, new ServerMsg
+                        // Single ACK back to sender
+                        await SendAsync(connection, new ServerMsg
                         {
-                            Type = "SEND_OK",
-                            ConversationId = convId
-                        }, ct);
+                            Type           = "SEND_OK",
+                            UserId         = connection.UserId,
+                            ConversationId = conversationId,
+                            FromUserId     = connection.UserId,
+                            Ciphertext     = ciphertext
+                        }, cancellationToken);
+
                         break;
+                    }
                 }
             }
         }
-        catch (Exception ex)
+        catch (Exception exception)
         {
-            Console.WriteLine($"Client error: {ex.Message}");
+            Console.WriteLine($"Client error: {exception.Message}");
         }
         finally
         {
-            // cleanup
-            if (conn.UserId is not null)
+            if (connection.UserId is not null)
             {
-                _users.TryRemove(conn.UserId, out _);
-                foreach (var kv in _rooms)
-                    kv.Value.TryRemove(conn.UserId, out _);
+                _users.TryRemove(connection.UserId, out _);
+                foreach (var keyValue in _rooms)
+                    keyValue.Value.TryRemove(connection.UserId, out _);
             }
 
-            conn.Dispose();
+            connection.Dispose();
         }
     }
 
-    private static void EnsureAuthed(ClientConn conn)
+    private static void EnsureAuthed(ClientConn connection)
     {
-        if (string.IsNullOrWhiteSpace(conn.UserId))
+        if (string.IsNullOrWhiteSpace(connection.UserId))
             throw new Exception("Not authenticated");
     }
 
     private static string ValidateTokenAndGetUserId(string? token)
     {
         if (string.IsNullOrWhiteSpace(token)) throw new Exception("Missing token");
-
-        // TODO: replace with your real JWT validation (same key/issuer/audience as API)
-        // Return claim: ClaimTypes.NameIdentifier
         return token; // PROTOTYPE ONLY
     }
 
-    private static async Task SendAsync(ClientConn conn, ServerMsg msg, CancellationToken ct)
+    private static async Task SendAsync(ClientConn connection, ServerMsg message, CancellationToken cancellationToken)
     {
-        var json = JsonSerializer.Serialize(msg);
+        var json  = JsonSerializer.Serialize(message);
         var bytes = Encoding.UTF8.GetBytes(json);
-        await WriteFrame(conn.Stream, bytes, ct);
+        
+        await WriteFrame(connection.Stream, bytes, cancellationToken);
     }
 
-    private static async Task WriteFrame(NetworkStream stream, byte[] payload, CancellationToken ct)
+    private static async Task WriteFrame(NetworkStream stream, byte[] payload, CancellationToken cancellationTokent)
     {
         var header = new byte[4];
+        
         BinaryPrimitives.WriteInt32BigEndian(header, payload.Length);
-        await stream.WriteAsync(header, ct);
-        await stream.WriteAsync(payload, ct);
-        await stream.FlushAsync(ct);
+        
+        await stream.WriteAsync(header, cancellationTokent);
+        await stream.WriteAsync(payload, cancellationTokent);
+        await stream.FlushAsync(cancellationTokent);
     }
 
-    private static async Task<byte[]?> ReadFrame(NetworkStream stream, CancellationToken ct)
+    private static async Task<byte[]?> ReadFrame(NetworkStream stream, CancellationToken cancellationToken)
     {
         var header = new byte[4];
-        var got = await ReadExactly(stream, header, 0, 4, ct);
+        var got = await ReadExactly(stream, header, 0, 4, cancellationToken);
         if (got == 0) return null;
 
         int len = BinaryPrimitives.ReadInt32BigEndian(header);
         if (len < 0 || len > 10_000_000) throw new Exception("Bad frame length");
 
         var payload = new byte[len];
-        await ReadExactly(stream, payload, 0, len, ct);
+        await ReadExactly(stream, payload, 0, len, cancellationToken);
         return payload;
     }
 
-    private static async Task<int> ReadExactly(NetworkStream stream, byte[] buf, int off, int count, CancellationToken ct)
+    private static async Task<int> ReadExactly(NetworkStream stream, byte[] buf, int off, int count, CancellationToken cancellationToken)
     {
         int total = 0;
         while (total < count)
         {
-            int n = await stream.ReadAsync(buf.AsMemory(off + total, count - total), ct);
+            int n = await stream.ReadAsync(buf.AsMemory(off + total, count - total), cancellationToken);
             if (n == 0) return total;
             total += n;
         }
@@ -195,10 +203,10 @@ public class TcpChatServer
 
     private sealed class ClientConn : IDisposable
     {
-        public TcpClient Tcp { get; }
+        public TcpClient     Tcp    { get; }
         public NetworkStream Stream { get; }
-        public string? UserId { get; set; }
-        public bool IsOpen => Tcp.Connected;
+        public string?       UserId { get; set; }
+        public bool          IsOpen => Tcp.Connected;
 
         public ClientConn(TcpClient tcp)
         {
@@ -215,18 +223,18 @@ public class TcpChatServer
 
     private sealed record ClientMsg
     {
-        public string Type { get; init; } = "";
-        public string? Token { get; init; }
+        public string  Type           { get; init; } = "";
+        public string? Token          { get; init; }
         public string? ConversationId { get; init; }
-        public string? Ciphertext { get; init; }
+        public string? Ciphertext     { get; init; }
     }
 
     private sealed record ServerMsg
     {
-        public string Type { get; init; } = "";
-        public string? UserId { get; init; }
+        public string  Type           { get; init; } = "";
+        public string? UserId         { get; init; }
         public string? ConversationId { get; init; }
-        public string? FromUserId { get; init; }
-        public string? Ciphertext { get; init; }
+        public string? FromUserId     { get; init; }
+        public string? Ciphertext     { get; init; }
     }
 }
